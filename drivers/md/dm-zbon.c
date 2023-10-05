@@ -1190,6 +1190,13 @@ static int zbon_iterate_devices(struct dm_target *ti,
 	return fn(ti, zc->dev, 0, ti->len, data);
 }
 
+static void zbon_io_hints(struct dm_target *ti, struct queue_limits *limits)
+{
+	struct zbon_c *zc = ti->private;
+
+	limits->physical_block_size = bdev_physical_block_size(zc->cache_bdev);
+	limits->io_min = limits->physical_block_size;
+}
 
 static struct target_type zbon_target = {
 	.name   = "zbon",
@@ -1204,6 +1211,7 @@ static struct target_type zbon_target = {
 	.status = zbon_status,
 	.prepare_ioctl = zbon_prepare_ioctl,
 	.iterate_devices = zbon_iterate_devices,
+	.io_hints = zbon_io_hints,
 };
 module_dm(zbon)
 
