@@ -218,8 +218,10 @@ static int zbon_rdwr_block(struct block_device *bdev, enum req_op op,
 	bio = bio_alloc(bdev, 1, op | REQ_SYNC | REQ_META | REQ_PRIO,
 			GFP_NOIO);
 	bio->bi_iter.bi_sector = sector;
-	bio_add_page(bio, page, PAGE_SIZE, 0);
-	ret = submit_bio_wait(bio);
+	ret = bio_add_page(bio, page, PAGE_SIZE, 0);
+	if (ret == PAGE_SIZE)
+		ret = submit_bio_wait(bio);
+
 	bio_put(bio);
 
 	return ret;
