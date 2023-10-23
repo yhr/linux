@@ -14,7 +14,9 @@
 #define DM_MSG_PREFIX		"zbon"
 #define ZB_MIN_BIOS		8192
 #define ZB_MAX_ACTIVE_WORKERS	32
-#define ZB_MAX_ACTIVE_META	((PAGE_SIZE - 8) / 24)
+
+#define ZB_METADATA_AREA_SIZE	(1024 * 1024) /* Reserve 1MB for metadata */
+#define ZB_ACTIVE_ZONE_MAX	(8096)	      /* Reasonable limit for current metadata scheme */
 
 struct zbon_zone {
 	struct blk_zone		blkz;
@@ -59,6 +61,7 @@ struct zbon_c {
 	unsigned long		nr_zones;
 	unsigned long		zone_nr_sectors;
 	unsigned long		max_active_zones;
+	unsigned int		cdev_block_size;
 
 	struct xarray zones;
 	struct zbon_buffer	*buffers;
@@ -75,7 +78,8 @@ struct zbon_c {
 	atomic_t		sectors_to_flush;
 	sector_t		throttle_limit;
 
-	struct page		*metadata_page;
+	struct page		*metadata_pages;
+	unsigned int		metadata_pages_order;
 	void			*metadata;
 	struct mutex		metadata_mtx;
 
@@ -209,8 +213,8 @@ static int zbon_init_zones(struct zbon_c *zc)
 	return 0;
 }
 
-static int zbon_rdwr_block(struct block_device *bdev, enum req_op op,
-			  sector_t sector, struct page *page)
+static int zbon_rdwr(struct block_device *bdev, enum req_op op,
+			  sector_t sector, struct page *page, unsigned int len)
 {
 	struct bio *bio;
 	int ret;
@@ -218,8 +222,8 @@ static int zbon_rdwr_block(struct block_device *bdev, enum req_op op,
 	bio = bio_alloc(bdev, 1, op | REQ_SYNC | REQ_META | REQ_PRIO,
 			GFP_NOIO);
 	bio->bi_iter.bi_sector = sector;
-	ret = bio_add_page(bio, page, PAGE_SIZE, 0);
-	if (ret == PAGE_SIZE)
+	ret = bio_add_page(bio, page, len, 0);
+	if (ret == len)
 		ret = submit_bio_wait(bio);
 
 	bio_put(bio);
@@ -227,12 +231,17 @@ static int zbon_rdwr_block(struct block_device *bdev, enum req_op op,
 	return ret;
 }
 
+static unsigned int zbon_metadata_size(unsigned int nr_active_zones) {
+	return sizeof(__le32) * 2 + nr_active_zones * sizeof(struct zbon_buffer_metadata);
+}
+
 static int zbon_read_state(struct zbon_c *zc) {
 	struct zbon_metadata *metadata = zc->metadata;
 	int ret;
-	int i,n;
+	unsigned int i, n, metadata_sz, metadata_blocks;
 
-	ret = zbon_rdwr_block(zc->cache_bdev, REQ_OP_READ, 0, zc->metadata_page);
+	ret = zbon_rdwr(zc->cache_bdev, REQ_OP_READ, 0,
+			zc->metadata_pages, zc->cdev_block_size);
 	if (ret)
 		return ret;
 
@@ -241,6 +250,18 @@ static int zbon_read_state(struct zbon_c *zc) {
 	}
 
 	n = le32_to_cpu(metadata->nr_active_buffers);
+	if (n > zc->max_active_zones) {
+		return -EINVAL;
+	}
+
+	metadata_sz = zbon_metadata_size(n);
+	metadata_blocks = DIV_ROUND_UP(metadata_sz, zc->cdev_block_size);
+	if (metadata_blocks > 1) {
+		ret = zbon_rdwr(zc->cache_bdev, REQ_OP_READ, 0,
+			zc->metadata_pages, zc->cdev_block_size * metadata_blocks);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0; i < n ; i++) {
 		struct zbon_buffer_metadata *m = &metadata->buffer_metadata[i];
@@ -274,6 +295,7 @@ static int zbon_store_state(struct zbon_c *zc) {
 	unsigned long flags;
 	int n = 0;
 	unsigned int i, ret;
+	unsigned int metadata_sz, metadata_blocks;
 
 	mutex_lock(&zc->metadata_mtx);
 	metadata->magic = cpu_to_le32(ZB_MAGIC);
@@ -304,7 +326,10 @@ static int zbon_store_state(struct zbon_c *zc) {
 	}
 
 	metadata->nr_active_buffers = n;
-	ret = zbon_rdwr_block(zc->cache_bdev, REQ_OP_WRITE, 0, zc->metadata_page);
+	metadata_sz = zbon_metadata_size(n);
+	metadata_blocks = DIV_ROUND_UP(metadata_sz, zc->cdev_block_size);
+	ret = zbon_rdwr(zc->cache_bdev, REQ_OP_WRITE, 0,
+			zc->metadata_pages, metadata_blocks * zc->cdev_block_size);
 
 	mutex_unlock(&zc->metadata_mtx);
 
@@ -591,6 +616,18 @@ static void zbon_deferred_work(struct work_struct *w)
 	mutex_unlock(&z->work_mtx);
 }
 
+static int zbon_alloc_metadata_pages(struct zbon_c *zc) {
+	unsigned int max_metadata_sz = zbon_metadata_size(zc->max_active_zones);
+
+	zc->metadata_pages_order = get_order(DIV_ROUND_UP(max_metadata_sz, PAGE_SIZE));
+	zc->metadata_pages = alloc_pages(GFP_NOIO, zc->metadata_pages_order);
+
+	if (!zc->metadata_pages)
+		return -ENOMEM;
+
+	return 0;
+}
+
 static int zbon_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct mapped_device *md;
@@ -650,7 +687,7 @@ static int zbon_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	zc->nr_zones = bdev_nr_zones(zc->bdev);
 	zc->zone_nr_sectors = bdev_zone_sectors(zc->bdev);
 	zc->max_active_zones = bdev_max_active_zones(zc->bdev);
-
+	zc->cdev_block_size = bdev_physical_block_size(zc->cache_bdev);
 
 	zc->min_write_sectors = to_sector(bdev_io_min(zc->bdev));
 	zc->throttle_limit = (throttle_limit * 1024 * 1024 * 1024) >> 9;
@@ -659,8 +696,8 @@ static int zbon_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		zc->max_active_zones = max_zone_caches;
 	}
 
-	if (zc->max_active_zones > ZB_MAX_ACTIVE_META)
-	       zc->max_active_zones = ZB_MAX_ACTIVE_META;
+	if (zc->max_active_zones > ZB_ACTIVE_ZONE_MAX)
+		zc->max_active_zones = ZB_ACTIVE_ZONE_MAX;
 
 	if (zbon_init_zones(zc)) {
 		ti->error = "Failed to initialize zones";
@@ -682,8 +719,7 @@ static int zbon_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	for (i = 0; i < zc->max_active_zones; i++) {
-		// TODO: if capacity != size we could save space..
-		zc->buffers[i].start = i * zc->zone_nr_sectors + (PAGE_SIZE >> 9);
+		zc->buffers[i].start = i * zc->zone_nr_sectors + (ZB_METADATA_AREA_SIZE >> 9);
 		zc->buffers[i].index = i;
 		zc->buffers[i].zone = NULL;
 		refcount_set(&zc->buffers[i].ref, 0);
@@ -723,13 +759,13 @@ static int zbon_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto err_destroy_flush_workqueue;
 	}
 
-	zc->metadata_page = alloc_page(GFP_NOIO);
-	if (!zc->metadata_page) {
-		ti->error = "Failed to allocate metadata page";
+	if (zbon_alloc_metadata_pages(zc)) {
+		ti->error = "Failed to allocate metadata pages";
 		ret = -ENOMEM;
 		goto err_destroy_kcopyd_client;
 	}
-	zc->metadata = page_address(zc->metadata_page);
+
+	zc->metadata = page_address(zc->metadata_pages);
 	mutex_init(&zc->metadata_mtx);
 
 	if (zbon_read_state(zc)) {
@@ -798,7 +834,7 @@ static void zbon_dtr(struct dm_target *ti)
 		kfree(xa_load(&zc->zones, i));
 	xa_destroy(&zc->zones);
 
-	__free_pages(zc->metadata_page, 0);
+	__free_pages(zc->metadata_pages, zc->metadata_pages_order);
 	kfree(zc->buffers);
 	kfree(zc->buffer_bits);
 	kfree(zc);
@@ -1194,7 +1230,7 @@ static void zbon_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
 	struct zbon_c *zc = ti->private;
 
-	limits->physical_block_size = bdev_physical_block_size(zc->cache_bdev);
+	limits->physical_block_size = zc->cdev_block_size;
 	limits->io_min = limits->physical_block_size;
 }
 
